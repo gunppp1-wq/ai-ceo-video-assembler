@@ -27,12 +27,15 @@ function downloadFile(url, destPath) {
 
 function runFfmpeg(imagePath, audioPath, outputPath) {
   return new Promise((resolve, reject) => {
-    const cmd = `ffmpeg -y -loop 1 -i "${imagePath}" -i "${audioPath}" -c:v libx264 -tune stillimage -c:a aac -b:a 192k -pix_fmt yuv420p -shortest "${outputPath}"`;
-    exec(cmd, { timeout: 50000 }, (error, stdout, stderr) => {
+    const cmd = `ffmpeg -y -loop 1 -i "${imagePath}" -i "${audioPath}" -c:v libx264 -preset ultrafast -tune stillimage -c:a aac -b:a 128k -pix_fmt yuv420p -shortest -t 30 "${outputPath}"`;
+    console.log("Running command:", cmd);
+    exec(cmd, { timeout: 45000, maxBuffer: 1024 * 1024 * 10 }, (error, stdout, stderr) => {
       if (error) {
-        reject(new Error(`ffmpeg failed: ${error.message} | stderr: ${stderr}`));
+        console.error("ffmpeg stderr:", stderr);
+        reject(new Error(`ffmpeg failed: ${error.message}`));
         return;
       }
+      console.log("ffmpeg completed successfully");
       resolve();
     });
   });
@@ -92,16 +95,21 @@ app.post("/assemble", async (req, res) => {
   const outputPath = path.join(tmpDir, `${jobId}.mp4`);
 
   try {
-    console.log(`[${jobId}] Downloading image and audio...`);
+    console.log(`[${jobId}] Step 1: Downloading image...`);
     await downloadFile(imageUrl, imagePath);
+    console.log(`[${jobId}] Step 2: Downloading audio...`);
     await downloadFile(audioUrl, audioPath);
+    console.log(`[${jobId}] Step 3: Files downloaded. Image size: ${fs.statSync(imagePath).size}, Audio size: ${fs.statSync(audioPath).size}`);
 
-    console.log(`[${jobId}] Running ffmpeg...`);
+    console.log(`[${jobId}] Step 4: Running ffmpeg...`);
     await runFfmpeg(imagePath, audioPath, outputPath);
+    console.log(`[${jobId}] Step 5: ffmpeg done. Output size: ${fs.statSync(outputPath).size}`);
 
-    console.log(`[${jobId}] Uploading to B2...`);
+    console.log(`[${jobId}] Step 6: Authorizing B2...`);
     const authData = await b2Authorize(b2KeyId, b2ApplicationKey);
+    console.log(`[${jobId}] Step 7: Getting upload URL...`);
     const uploadUrlData = await b2GetUploadUrl(authData.apiUrl, authData.authorizationToken, b2BucketId);
+    console.log(`[${jobId}] Step 8: Uploading to B2...`);
     const uploadResult = await b2UploadFile(uploadUrlData.uploadUrl, uploadUrlData.authorizationToken, outputFileName, outputPath, "video/mp4");
 
     console.log(`[${jobId}] Done: ${outputFileName}`);
