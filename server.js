@@ -27,9 +27,9 @@ function downloadFile(url, destPath) {
 
 function runFfmpeg(imagePath, audioPath, outputPath) {
   return new Promise((resolve, reject) => {
-    const cmd = `ffmpeg -y -loop 1 -i "${imagePath}" -i "${audioPath}" -c:v libx264 -preset ultrafast -tune stillimage -c:a aac -b:a 128k -pix_fmt yuv420p -shortest -t 30 "${outputPath}"`;
+    const cmd = `ffmpeg -y -loop 1 -i "${imagePath}" -i "${audioPath}" -vf "scale=1280:720" -c:v libx264 -preset ultrafast -tune stillimage -c:a aac -b:a 96k -pix_fmt yuv420p -r 15 -shortest -t 20 "${outputPath}"`;
     console.log("Running command:", cmd);
-    exec(cmd, { timeout: 45000, maxBuffer: 1024 * 1024 * 10 }, (error, stdout, stderr) => {
+    exec(cmd, { timeout: 170000, maxBuffer: 1024 * 1024 * 10 }, (error, stdout, stderr) => {
       if (error) {
         console.error("ffmpeg stderr:", stderr);
         reject(new Error(`ffmpeg failed: ${error.message}`));
