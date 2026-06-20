@@ -108,7 +108,7 @@ app.post("/assemble", async (req, res) => {
     console.log(`[${jobId}] Step 6: Authorizing B2...`);
     const authData = await b2Authorize(b2KeyId, b2ApplicationKey);
     console.log(`[${jobId}] Step 7: Getting upload URL...`);
-    const uploadUrlData = await b2GetUploadUrl(authData.apiUrl, authData.authorizationToken, b2BucketId);
+    const apiUrl = authData.apiInfo.storageApi.apiUrl; const uploadUrlData = await b2GetUploadUrl(apiUrl, authData.authorizationToken, b2BucketId);
     console.log(`[${jobId}] Step 8: Uploading to B2...`);
     const uploadResult = await b2UploadFile(uploadUrlData.uploadUrl, uploadUrlData.authorizationToken, outputFileName, outputPath, "video/mp4");
 
