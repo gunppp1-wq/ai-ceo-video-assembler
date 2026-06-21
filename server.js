@@ -151,7 +151,7 @@ app.post("/assemble", async (req, res) => {
     const inputs = imagePaths.map(p => `-loop 1 -t ${durationPerImage} -i "${p}"`).join(" ");
     const filterComplex = buildMultiImageFilter(imageUrls.length, durationPerImage);
 
-    const cmd = `cd ${tmpDir} && ffmpeg -y ${inputs} -i "${audioPath}" -filter_complex "${filterComplex}" -map "[finalv]" -map ${imageUrls.length}:a -c:v libx264 -preset ultrafast -c:a aac -b:a 96k -shortest -t ${audioDuration} "${outputPath}"`;
+    const cmd = `cd ${tmpDir} && ffmpeg -y ${inputs} -i "${audioPath}" -filter_complex "${filterComplex}" -map "[finalv]" -map ${imageUrls.length}:a -c:v libx264 -preset ultrafast -c:a aac -b:a 96k -shortest -t ${Math.min(audioDuration, 60)} "${outputPath}"`;
 
     await runCommand(cmd, 170000);
     console.log(`[${jobId}] Step 5: ffmpeg done. Output size: ${fs.statSync(outputPath).size}`);
