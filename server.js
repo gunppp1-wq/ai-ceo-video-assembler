@@ -56,7 +56,7 @@ function formatAssTime(seconds) {
   return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(5, "0")}`;
 }
 
-function buildAssFromWords(words, maxWordsPerLine = 4) {
+function buildAssFromWords(words, maxWordsPerLine = 6, pauseThreshold = 0.4) {
   const header = `[Script Info]
 ScriptType: v4.00+
 PlayResX: 1280
@@ -74,8 +74,23 @@ Format: Layer, Start, End, Style, Text
   if (words.length === 0) {
     return header;
   }
-  for (let i = 0; i < words.length; i += maxWordsPerLine) {
-    const chunk = words.slice(i, i + maxWordsPerLine);
+
+  let chunk = [words[0]];
+  for (let i = 1; i < words.length; i++) {
+    const gap = words[i].start - words[i - 1].end;
+    const wouldExceedMax = chunk.length >= maxWordsPerLine;
+    const hasNaturalPause = gap >= pauseThreshold;
+
+    if (wouldExceedMax || hasNaturalPause) {
+      const start = chunk[0].start;
+      const end = chunk[chunk.length - 1].end;
+      const text = chunk.map(w => w.word).join(" ").replace(/[\\{}]/g, "");
+      events += `Dialogue: 0,${formatAssTime(start)},${formatAssTime(end)},Default,${text}\n`;
+      chunk = [];
+    }
+    chunk.push(words[i]);
+  }
+  if (chunk.length > 0) {
     const start = chunk[0].start;
     const end = chunk[chunk.length - 1].end;
     const text = chunk.map(w => w.word).join(" ").replace(/[\\{}]/g, "");
@@ -105,7 +120,7 @@ function buildMultiImageFilter(numImages, durationPerImage) {
 }
 
 app.get("/", (req, res) => {
-  res.json({ status: "ok", message: "ai-ceo-video-assembler is running", version: "2-multi-image-captions" });
+  res.json({ status: "ok", message: "ai-ceo-video-assembler is running", version: "2b-pause-aware-captions" });
 });
 
 app.post("/assemble", async (req, res) => {
@@ -119,7 +134,6 @@ app.post("/assemble", async (req, res) => {
   const tmpDir = "/tmp";
   const audioPath = path.join(tmpDir, `${jobId}.mp3`);
   const outputPath = path.join(tmpDir, `${jobId}.mp4`);
-  const assPath = path.join(tmpDir, `captions_${jobId}.ass`);
   const imagePaths = imageUrls.map((_, i) => path.join(tmpDir, `${jobId}_img${i}.jpg`));
 
   try {
@@ -196,7 +210,7 @@ app.post("/assemble", async (req, res) => {
     console.error(`[${jobId}] ERROR:`, err.message);
     res.status(500).json({ error: err.message });
   } finally {
-    [...imagePaths, audioPath, outputPath, assPath, path.join(tmpDir, "captions.ass")].forEach((p) => {
+    [...imagePaths, audioPath, outputPath, path.join(tmpDir, "captions.ass")].forEach((p) => {
       try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch (e) {}
     });
   }
@@ -204,5 +218,5 @@ app.post("/assemble", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`ai-ceo-video-assembler (v2: multi-image + captions) listening on port ${PORT}`);
+  console.log(`ai-ceo-video-assembler (v2b: pause-aware captions) listening on port ${PORT}`);
 });
