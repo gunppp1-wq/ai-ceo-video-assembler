@@ -59,8 +59,8 @@ function formatAssTime(seconds) {
 function buildAssFromWords(words, maxWordsPerLine = 6, pauseThreshold = 0.4) {
   const header = `[Script Info]
 ScriptType: v4.00+
-PlayResX: 1280
-PlayResY: 720
+PlayResX: 1080
+PlayResY: 1920
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Outline, Shadow, Alignment, MarginV
@@ -163,7 +163,7 @@ app.post("/assemble-frames", async (req, res) => {
       const sourceFps = numFrames / durationPerScene;
       const clipPath = path.join(tmpDir, `${jobId}_clip${sceneIdx}.mp4`);
 
-      const cmd = `ffmpeg -y -framerate ${sourceFps} -i "${sceneDirs[sceneIdx]}/frame%d.jpg" -t ${durationPerScene} -vf "fps=25,scale=1280:720" -c:v libx264 -preset ultrafast -pix_fmt yuv420p "${clipPath}"`;
+      const cmd = `ffmpeg -y -framerate ${sourceFps} -i "${sceneDirs[sceneIdx]}/frame%d.jpg" -t ${durationPerScene} -vf "fps=25,scale=1080:1920" -c:v libx264 -preset ultrafast -pix_fmt yuv420p "${clipPath}"`;
       await runCommand(cmd, 60000);
       sceneClipPaths.push(clipPath);
       console.log(`[${jobId}] Scene ${sceneIdx} clip created (${durationPerScene.toFixed(2)}s)`);
@@ -241,3 +241,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`ai-ceo-video-assembler (v4: real frame sequences) listening on port ${PORT}`);
 });
+
+
