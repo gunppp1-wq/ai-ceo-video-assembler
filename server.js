@@ -56,7 +56,7 @@ function formatAssTime(seconds) {
   return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(5, "0")}`;
 }
 
-function buildAssFromWords(words, maxWordsPerLine = 6, pauseThreshold = 0.4) {
+function buildAssFromWords(words, maxWordsPerLine = 3, pauseThreshold = 0.4) {
   const header = `[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
@@ -64,7 +64,7 @@ PlayResY: 1920
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Outline, Shadow, Alignment, MarginV
-Style: Default,Arial,52,&H0000FFFF,&H00000000,&H80000000,1,4,0,2,90
+Style: Default,Arial,52,&H0000FFFF,&H00000000,&H80000000,1,4,0,2,580
 
 [Events]
 Format: Layer, Start, End, Style, Text
@@ -241,5 +241,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`ai-ceo-video-assembler (v4: real frame sequences) listening on port ${PORT}`);
 });
+
+
 
 
