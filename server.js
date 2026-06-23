@@ -111,7 +111,8 @@ app.get("/", (req, res) => {
 });
 
 app.post("/assemble-frames", async (req, res) => {
-  const { sceneFrameUrls, audioUrl, b2KeyId, b2ApplicationKey, b2BucketId, outputFileName } = req.body;
+  const { sceneFrameUrls, sceneVideoUrls, audioUrl, b2KeyId, b2ApplicationKey, b2BucketId, outputFileName } = req.body;
+  const realClipUrls = sceneVideoUrls || [];
 
   if (!sceneFrameUrls || !Array.isArray(sceneFrameUrls) || sceneFrameUrls.length === 0 || !audioUrl || !b2KeyId || !b2ApplicationKey || !b2BucketId || !outputFileName) {
     return res.status(400).json({ error: "Missing required fields: sceneFrameUrls (array of arrays), audioUrl, b2KeyId, b2ApplicationKey, b2BucketId, outputFileName" });
@@ -157,16 +158,35 @@ app.post("/assemble-frames", async (req, res) => {
     const assContent = buildAssFromWords(words);
     fs.writeFileSync(path.join(tmpDir, "captions.ass"), assContent);
 
-    console.log(`[${jobId}] Step 4: Converting each scene's frames into a real video clip...`);
+    console.log(`[${jobId}] Step 4: Building each scene clip (real video where available, frame sequence otherwise)...`);
+    const rawClipPaths = [];
     for (let sceneIdx = 0; sceneIdx < sceneDirs.length; sceneIdx++) {
+      const clipPath = path.join(tmpDir, `${jobId}_clip${sceneIdx}.mp4`);
+      const realVideoUrl = realClipUrls[sceneIdx];
+
+      if (realVideoUrl) {
+        const rawClipPath = path.join(tmpDir, `${jobId}_raw${sceneIdx}.mp4`);
+        rawClipPaths.push(rawClipPath);
+        console.log(`[${jobId}] Scene ${sceneIdx}: downloading real clip from Pexels...`);
+        await downloadFile(realVideoUrl, rawClipPath);
+
+        const cmd = `ffmpeg -y -i "${rawClipPath}" -t ${durationPerScene} -vf "fps=25,scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920" -an -c:v libx264 -preset ultrafast -pix_fmt yuv420p "${clipPath}"`;
+        try {
+          await runCommand(cmd, 60000);
+          sceneClipPaths.push(clipPath);
+          console.log(`[${jobId}] Scene ${sceneIdx} real-clip motion created (${durationPerScene.toFixed(2)}s)`);
+          continue;
+        } catch (realClipErr) {
+          console.log(`[${jobId}] WARNING: real clip failed for scene ${sceneIdx}, falling back to frame sequence:`, realClipErr.message);
+        }
+      }
+
       const numFrames = sceneFrameUrls[sceneIdx].length;
       const sourceFps = numFrames / durationPerScene;
-      const clipPath = path.join(tmpDir, `${jobId}_clip${sceneIdx}.mp4`);
-
       const cmd = `ffmpeg -y -framerate ${sourceFps} -i "${sceneDirs[sceneIdx]}/frame%d.jpg" -t ${durationPerScene} -vf "fps=25,scale=1080:1920" -c:v libx264 -preset ultrafast -pix_fmt yuv420p "${clipPath}"`;
       await runCommand(cmd, 60000);
       sceneClipPaths.push(clipPath);
-      console.log(`[${jobId}] Scene ${sceneIdx} clip created (${durationPerScene.toFixed(2)}s)`);
+      console.log(`[${jobId}] Scene ${sceneIdx} frame-sequence clip created (${durationPerScene.toFixed(2)}s)`);
     }
 
     console.log(`[${jobId}] Step 5: Concatenating scene clips, adding captions and audio...`);
@@ -224,6 +244,7 @@ app.post("/assemble-frames", async (req, res) => {
     try {
       const cleanupPaths = [audioPath, outputPath, path.join(tmpDir, "captions.ass"), path.join(tmpDir, `${jobId}_concat.txt`), path.join(tmpDir, `${jobId}_concatenated.mp4`)];
       sceneClipPaths.forEach(p => cleanupPaths.push(p));
+      rawClipPaths.forEach(p => cleanupPaths.push(p));
       cleanupPaths.forEach((p) => {
         try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch (e) {}
       });
@@ -241,6 +262,9 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`ai-ceo-video-assembler (v4: real frame sequences) listening on port ${PORT}`);
 });
+
+
+
 
 
 
