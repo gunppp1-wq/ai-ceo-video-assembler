@@ -110,6 +110,90 @@ app.get("/", (req, res) => {
   res.json({ status: "ok", message: "ai-ceo-video-assembler is running", version: "4-real-frame-sequences" });
 });
 
+app.post("/analyze-extract", async (req, res) => {
+  const { videoUrl, b2KeyId, b2ApplicationKey, b2BucketId } = req.body;
+
+  if (!videoUrl || !b2KeyId || !b2ApplicationKey || !b2BucketId) {
+    return res.status(400).json({ error: "Missing required fields: videoUrl, b2KeyId, b2ApplicationKey, b2BucketId" });
+  }
+
+  const jobId = crypto.randomUUID();
+  const tmpDir = "/tmp";
+  const videoPath = path.join(tmpDir, `${jobId}_input.mp4`);
+  const audioPath = path.join(tmpDir, `${jobId}_audio.mp3`);
+  const frameDir = path.join(tmpDir, `${jobId}_frames`);
+
+  try {
+    console.log(`[${jobId}] Step 1: Downloading video for analysis...`);
+    await downloadFile(videoUrl, videoPath);
+
+    console.log(`[${jobId}] Step 2: Extracting audio track...`);
+    await runCommand(`ffmpeg -y -i "${videoPath}" -vn -acodec libmp3lame -q:a 4 "${audioPath}"`, 60000);
+
+    console.log(`[${jobId}] Step 3: Extracting frames (1 every 2 seconds)...`);
+    fs.mkdirSync(frameDir, { recursive: true });
+    await runCommand(`ffmpeg -y -i "${videoPath}" -vf "fps=0.5" "${path.join(frameDir, "frame%d.jpg")}"`, 60000);
+    const frameFiles = fs.readdirSync(frameDir).sort();
+
+    console.log(`[${jobId}] Step 4: Authorizing B2 for upload...`);
+    const credentials = Buffer.from(`${b2KeyId}:${b2ApplicationKey}`).toString("base64");
+    const authRes = await fetch("https://api.backblazeb2.com/b2api/v3/b2_authorize_account", {
+      headers: { Authorization: `Basic ${credentials}` }
+    });
+    if (!authRes.ok) throw new Error(`B2 authorize failed: ${authRes.status} ${await authRes.text()}`);
+    const authData = await authRes.json();
+    const apiUrl = authData.apiInfo.storageApi.apiUrl;
+
+    async function uploadToB2(localPath, remoteFileName, contentType) {
+      const uploadUrlRes = await fetch(`${apiUrl}/b2api/v3/b2_get_upload_url?bucketId=${b2BucketId}`, {
+        headers: { Authorization: authData.authorizationToken }
+      });
+      const uploadUrlData = await uploadUrlRes.json();
+      const fileBuffer = fs.readFileSync(localPath);
+      const sha1Hex = crypto.createHash("sha1").update(fileBuffer).digest("hex");
+      const uploadRes = await fetch(uploadUrlData.uploadUrl, {
+        method: "POST",
+        headers: {
+          Authorization: uploadUrlData.authorizationToken,
+          "X-Bz-File-Name": encodeURIComponent(remoteFileName),
+          "Content-Type": contentType,
+          "X-Bz-Content-Sha1": sha1Hex,
+          "Content-Length": fileBuffer.length
+        },
+        body: fileBuffer
+      });
+      if (!uploadRes.ok) throw new Error(`B2 upload failed for ${remoteFileName}: ${uploadRes.status}`);
+      return remoteFileName;
+    }
+
+    console.log(`[${jobId}] Step 5: Uploading extracted audio...`);
+    const audioFileName = `extracted/${jobId}_audio.mp3`;
+    await uploadToB2(audioPath, audioFileName, "audio/mpeg");
+
+    console.log(`[${jobId}] Step 6: Uploading ${frameFiles.length} extracted frames...`);
+    const frameFileNames = [];
+    for (const frameFile of frameFiles) {
+      const remoteFileName = `extracted/${jobId}_${frameFile}`;
+      await uploadToB2(path.join(frameDir, frameFile), remoteFileName, "image/jpeg");
+      frameFileNames.push(remoteFileName);
+    }
+
+    console.log(`[${jobId}] Done: audio + ${frameFileNames.length} frames uploaded`);
+    res.json({ success: true, audioFileName, frameFileNames });
+  } catch (err) {
+    console.error(`[${jobId}] ERROR:`, err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    try {
+      if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+      if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
+      if (fs.existsSync(frameDir)) fs.rmSync(frameDir, { recursive: true, force: true });
+    } catch (cleanupErr) {
+      console.log("Cleanup error (non-fatal):", cleanupErr.message);
+    }
+  }
+});
+
 app.post("/assemble-frames", async (req, res) => {
   const { sceneFrameUrls, sceneVideoUrls, audioUrl, b2KeyId, b2ApplicationKey, b2BucketId, outputFileName } = req.body;
   const realClipUrls = sceneVideoUrls || [];
@@ -262,6 +346,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`ai-ceo-video-assembler (v4: real frame sequences) listening on port ${PORT}`);
 });
+
 
 
 
