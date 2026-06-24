@@ -136,7 +136,7 @@ app.post("/video-duration", async (req, res) => {
 });
 
 app.post("/analyze-extract", async (req, res) => {
-  const { videoUrl, b2KeyId, b2ApplicationKey, b2BucketId, startSeconds, chunkDuration } = req.body;
+  const { videoUrl, b2KeyId, b2ApplicationKey, b2BucketId, startSeconds, chunkDuration, audioOnly } = req.body;
   const isChunked = (startSeconds !== undefined && startSeconds !== null);
 
   if (!videoUrl || !b2KeyId || !b2ApplicationKey || !b2BucketId) {
@@ -150,6 +150,45 @@ app.post("/analyze-extract", async (req, res) => {
   const frameDir = path.join(tmpDir, `${jobId}_frames`);
 
   try {
+    if (audioOnly) {
+      console.log(`[${jobId}] Audio-only mode: extracting audio track directly from URL, no frames...`);
+      await runCommand(`ffmpeg -y -i "${videoUrl}" -vn -acodec libmp3lame -q:a 4 "${audioPath}"`, 3600000);
+
+      console.log(`[${jobId}] Step (audio-only): Authorizing B2 for upload...`);
+      const credentials = Buffer.from(`${b2KeyId}:${b2ApplicationKey}`).toString("base64");
+      const authRes = await fetch("https://api.backblazeb2.com/b2api/v3/b2_authorize_account", {
+        headers: { Authorization: `Basic ${credentials}` }
+      });
+      if (!authRes.ok) throw new Error(`B2 authorize failed: ${authRes.status} ${await authRes.text()}`);
+      const authData = await authRes.json();
+      const apiUrl = authData.apiInfo.storageApi.apiUrl;
+
+      const uploadUrlRes = await fetch(`${apiUrl}/b2api/v3/b2_get_upload_url?bucketId=${b2BucketId}`, {
+        headers: { Authorization: authData.authorizationToken }
+      });
+      const uploadUrlData = await uploadUrlRes.json();
+      const audioFileName = `extracted/${jobId}_audio.mp3`;
+      const fileBuffer = fs.readFileSync(audioPath);
+      const sha1Hex = crypto.createHash("sha1").update(fileBuffer).digest("hex");
+      const uploadRes = await fetch(uploadUrlData.uploadUrl, {
+        method: "POST",
+        headers: {
+          Authorization: uploadUrlData.authorizationToken,
+          "X-Bz-File-Name": encodeURIComponent(audioFileName),
+          "Content-Type": "audio/mpeg",
+          "X-Bz-Content-Sha1": sha1Hex,
+          "Content-Length": fileBuffer.length
+        },
+        body: fileBuffer
+      });
+      if (!uploadRes.ok) throw new Error(`B2 upload failed for ${audioFileName}: ${uploadRes.status}`);
+      const uploadResult = await uploadRes.json();
+
+      fs.unlinkSync(audioPath);
+      console.log(`[${jobId}] Audio-only extraction complete`);
+      return res.json({ success: true, audioOnly: true, audio: { fileName: audioFileName, fileId: uploadResult.fileId } });
+    }
+
     if (isChunked) {
       console.log(`[${jobId}] Chunked mode: extracting frames from ${startSeconds}s for ${chunkDuration}s, reading directly from URL (no full download)...`);
       fs.mkdirSync(frameDir, { recursive: true });
@@ -424,6 +463,8 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`ai-ceo-video-assembler (v4: real frame sequences) listening on port ${PORT}`);
 });
+
+
 
 
 
