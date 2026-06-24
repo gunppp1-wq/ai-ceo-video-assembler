@@ -136,7 +136,8 @@ app.post("/video-duration", async (req, res) => {
 });
 
 app.post("/analyze-extract", async (req, res) => {
-  const { videoUrl, b2KeyId, b2ApplicationKey, b2BucketId } = req.body;
+  const { videoUrl, b2KeyId, b2ApplicationKey, b2BucketId, startSeconds, chunkDuration } = req.body;
+  const isChunked = (startSeconds !== undefined && startSeconds !== null);
 
   if (!videoUrl || !b2KeyId || !b2ApplicationKey || !b2BucketId) {
     return res.status(400).json({ error: "Missing required fields: videoUrl, b2KeyId, b2ApplicationKey, b2BucketId" });
@@ -149,6 +150,57 @@ app.post("/analyze-extract", async (req, res) => {
   const frameDir = path.join(tmpDir, `${jobId}_frames`);
 
   try {
+    if (isChunked) {
+      console.log(`[${jobId}] Chunked mode: extracting frames from ${startSeconds}s for ${chunkDuration}s, reading directly from URL (no full download)...`);
+      fs.mkdirSync(frameDir, { recursive: true });
+      const startFrameNumber = Math.floor(startSeconds / 2) + 1;
+      await runCommand(`ffmpeg -y -ss ${startSeconds} -i "${videoUrl}" -t ${chunkDuration} -vf "fps=0.5" -start_number ${startFrameNumber} "${path.join(frameDir, "frame%d.jpg")}"`, 3600000);
+      const frameFiles = fs.readdirSync(frameDir).sort();
+
+      console.log(`[${jobId}] Step (chunked): Authorizing B2 for upload...`);
+      const credentials = Buffer.from(`${b2KeyId}:${b2ApplicationKey}`).toString("base64");
+      const authRes = await fetch("https://api.backblazeb2.com/b2api/v3/b2_authorize_account", {
+        headers: { Authorization: `Basic ${credentials}` }
+      });
+      if (!authRes.ok) throw new Error(`B2 authorize failed: ${authRes.status} ${await authRes.text()}`);
+      const authData = await authRes.json();
+      const apiUrl = authData.apiInfo.storageApi.apiUrl;
+
+      async function uploadToB2Chunked(localPath, remoteFileName, contentType) {
+        const uploadUrlRes = await fetch(`${apiUrl}/b2api/v3/b2_get_upload_url?bucketId=${b2BucketId}`, {
+          headers: { Authorization: authData.authorizationToken }
+        });
+        const uploadUrlData = await uploadUrlRes.json();
+        const fileBuffer = fs.readFileSync(localPath);
+        const sha1Hex = crypto.createHash("sha1").update(fileBuffer).digest("hex");
+        const uploadRes = await fetch(uploadUrlData.uploadUrl, {
+          method: "POST",
+          headers: {
+            Authorization: uploadUrlData.authorizationToken,
+            "X-Bz-File-Name": encodeURIComponent(remoteFileName),
+            "Content-Type": contentType,
+            "X-Bz-Content-Sha1": sha1Hex,
+            "Content-Length": fileBuffer.length
+          },
+          body: fileBuffer
+        });
+        if (!uploadRes.ok) throw new Error(`B2 upload failed for ${remoteFileName}: ${uploadRes.status}`);
+        const uploadResult = await uploadRes.json();
+        return { fileName: remoteFileName, fileId: uploadResult.fileId };
+      }
+
+      const chunkFrameResults = [];
+      for (const frameFile of frameFiles) {
+        const remoteFileName = `extracted/${jobId}_${frameFile}`;
+        const result = await uploadToB2Chunked(path.join(frameDir, frameFile), remoteFileName, "image/jpeg");
+        chunkFrameResults.push(result);
+      }
+
+      fs.rmSync(frameDir, { recursive: true, force: true });
+      console.log(`[${jobId}] Chunked extraction complete: ${chunkFrameResults.length} frames from this window`);
+      return res.json({ success: true, chunked: true, frames: chunkFrameResults });
+    }
+
     console.log(`[${jobId}] Step 1: Downloading video for analysis...`);
     await downloadFile(videoUrl, videoPath);
 
@@ -372,6 +424,8 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`ai-ceo-video-assembler (v4: real frame sequences) listening on port ${PORT}`);
 });
+
+
 
 
 
