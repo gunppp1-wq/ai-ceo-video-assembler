@@ -49,6 +49,18 @@ function getAudioDuration(audioPath) {
   });
 }
 
+function probeRemoteDuration(videoUrl) {
+  return new Promise((resolve, reject) => {
+    exec(`ffprobe -v quiet -show_entries format=duration -of csv=p=0 "${videoUrl}"`, { timeout: 30000 }, (error, stdout) => {
+      if (error) {
+        reject(new Error(`ffprobe (remote) failed: ${error.message}`));
+        return;
+      }
+      resolve(parseFloat(stdout.trim()));
+    });
+  });
+}
+
 function formatAssTime(seconds) {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
@@ -108,6 +120,19 @@ async function transcribeAudio(audioPath) {
 
 app.get("/", (req, res) => {
   res.json({ status: "ok", message: "ai-ceo-video-assembler is running", version: "4-real-frame-sequences" });
+});
+
+app.post("/video-duration", async (req, res) => {
+  const { videoUrl } = req.body;
+  if (!videoUrl) {
+    return res.status(400).json({ error: "videoUrl is required" });
+  }
+  try {
+    const duration = await probeRemoteDuration(videoUrl);
+    res.json({ success: true, durationSeconds: duration });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post("/analyze-extract", async (req, res) => {
@@ -347,6 +372,8 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`ai-ceo-video-assembler (v4: real frame sequences) listening on port ${PORT}`);
 });
+
+
 
 
 
