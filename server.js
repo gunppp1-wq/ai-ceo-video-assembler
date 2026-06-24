@@ -163,23 +163,24 @@ app.post("/analyze-extract", async (req, res) => {
         body: fileBuffer
       });
       if (!uploadRes.ok) throw new Error(`B2 upload failed for ${remoteFileName}: ${uploadRes.status}`);
-      return remoteFileName;
+      const uploadResult = await uploadRes.json();
+      return { fileName: remoteFileName, fileId: uploadResult.fileId };
     }
 
     console.log(`[${jobId}] Step 5: Uploading extracted audio...`);
     const audioFileName = `extracted/${jobId}_audio.mp3`;
-    await uploadToB2(audioPath, audioFileName, "audio/mpeg");
+    const audioUploadResult = await uploadToB2(audioPath, audioFileName, "audio/mpeg");
 
     console.log(`[${jobId}] Step 6: Uploading ${frameFiles.length} extracted frames...`);
-    const frameFileNames = [];
+    const frameResults = [];
     for (const frameFile of frameFiles) {
       const remoteFileName = `extracted/${jobId}_${frameFile}`;
-      await uploadToB2(path.join(frameDir, frameFile), remoteFileName, "image/jpeg");
-      frameFileNames.push(remoteFileName);
+      const result = await uploadToB2(path.join(frameDir, frameFile), remoteFileName, "image/jpeg");
+      frameResults.push(result);
     }
 
-    console.log(`[${jobId}] Done: audio + ${frameFileNames.length} frames uploaded`);
-    res.json({ success: true, audioFileName, frameFileNames });
+    console.log(`[${jobId}] Done: audio + ${frameResults.length} frames uploaded`);
+    res.json({ success: true, audio: audioUploadResult, frames: frameResults });
   } catch (err) {
     console.error(`[${jobId}] ERROR:`, err.message);
     res.status(500).json({ error: err.message });
@@ -346,6 +347,8 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`ai-ceo-video-assembler (v4: real frame sequences) listening on port ${PORT}`);
 });
+
+
 
 
 
