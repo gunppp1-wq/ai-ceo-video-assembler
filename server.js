@@ -4,6 +4,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const { exec } = require("child_process");
+const { startPiperServer, waitForPiperReady, isPiperReady, getPiperEndpoint } = require("./piper-manager");
 
 const app = express();
 app.use(express.json({ limit: "20mb" }));
@@ -120,6 +121,46 @@ async function transcribeAudio(audioPath) {
 
 app.get("/", (req, res) => {
   res.json({ status: "ok", message: "ai-ceo-video-assembler is running", version: "4-real-frame-sequences" });
+});
+app.get("/generate-speech/health", (req, res) => {
+  res.json({ ready: isPiperReady() });
+});
+
+app.post("/generate-speech", async (req, res) => {
+  const { text, voice, lengthScale } = req.body || {};
+
+  if (!text || typeof text !== "string" || text.trim().length === 0) {
+    return res.status(400).json({ error: "text is required" });
+  }
+
+  if (!isPiperReady()) {
+    return res.status(503).json({ error: "piper_not_ready" });
+  }
+
+  try {
+    const piperRes = await fetch(getPiperEndpoint(), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text,
+        ...(voice ? { voice } : {}),
+        ...(lengthScale ? { length_scale: lengthScale } : {}),
+      }),
+    });
+
+    if (!piperRes.ok) {
+      const errBody = await piperRes.text().catch(() => "");
+      console.error("[generate-speech] piper returned error:", piperRes.status, errBody);
+      return res.status(502).json({ error: "piper_generation_failed", detail: errBody });
+    }
+
+    const audioBuffer = Buffer.from(await piperRes.arrayBuffer());
+    res.set("Content-Type", "audio/wav");
+    return res.send(audioBuffer);
+  } catch (err) {
+    console.error("[generate-speech] unexpected error:", err.message);
+    return res.status(500).json({ error: "internal_error", detail: err.message });
+  }
 });
 
 app.post("/video-duration", async (req, res) => {
@@ -457,9 +498,14 @@ app.post("/assemble-frames", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`ai-ceo-video-assembler (v4: real frame sequences) listening on port ${PORT}`);
+  startPiperServer();
+  await waitForPiperReady();
 });
+
+
+
 
 
 
