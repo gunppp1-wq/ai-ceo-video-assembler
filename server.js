@@ -240,15 +240,12 @@ app.post("/analyze-extract", async (req, res) => {
       return res.json({ success: true, chunked: true, frames: chunkFrameResults });
     }
 
-    console.log(`[${jobId}] Step 1: Downloading video for analysis...`);
-    await downloadFile(videoUrl, videoPath);
+    console.log(`[${jobId}] Step 1: Extracting audio track directly from URL (no full download)...`);
+    await runCommand(`ffmpeg -y -i "${videoUrl}" -vn -acodec libmp3lame -q:a 4 "${audioPath}"`, 3600000);
 
-    console.log(`[${jobId}] Step 2: Extracting audio track...`);
-    await runCommand(`ffmpeg -y -i "${videoPath}" -vn -acodec libmp3lame -q:a 4 "${audioPath}"`, 3600000);
-
-    console.log(`[${jobId}] Step 3: Extracting frames (1 every 2 seconds)...`);
+    console.log(`[${jobId}] Step 2: Extracting frames directly from URL (no full download)...`);
     fs.mkdirSync(frameDir, { recursive: true });
-    await runCommand(`ffmpeg -y -i "${videoPath}" -vf "fps=0.5" "${path.join(frameDir, "frame%d.jpg")}"`, 3600000);
+    await runCommand(`ffmpeg -y -i "${videoUrl}" -vf "fps=0.5" "${path.join(frameDir, "frame%d.jpg")}"`, 3600000);
     const frameFiles = fs.readdirSync(frameDir).sort();
 
     console.log(`[${jobId}] Step 4: Authorizing B2 for upload...`);
@@ -463,6 +460,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`ai-ceo-video-assembler (v4: real frame sequences) listening on port ${PORT}`);
 });
+
 
 
 
