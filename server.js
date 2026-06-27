@@ -388,7 +388,7 @@ app.post("/assemble-frames", async (req, res) => {
     console.log(`[${jobId}] Step 3: Transcribing audio for captions...`);
     let words = [];
     try {
-      words = await transcribeAudio(audioPath);
+      // Disabled: transcribeAudio() was causing OOM crashes on Render free tier (confirmed via Events log 2026-06-27). words stays [].
       console.log(`[${jobId}] Transcribed ${words.length} words`);
     } catch (transcribeErr) {
       console.log(`[${jobId}] WARNING: Transcription failed, proceeding without captions:`, transcribeErr.message);
