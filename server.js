@@ -409,7 +409,7 @@ app.post("/assemble-frames", async (req, res) => {
         console.log(`[${jobId}] Scene ${sceneIdx}: downloading real clip from Pexels...`);
         await downloadFile(realVideoUrl, rawClipPath);
 
-        const cmd = `ffmpeg -y -i "${rawClipPath}" -t ${durationPerScene} -vf "fps=25,scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920" -an -c:v libx264 -preset ultrafast -pix_fmt yuv420p "${clipPath}"`;
+        const cmd = `ffmpeg -y -i "${rawClipPath}" -t ${durationPerScene} -vf "fps=25,scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920" -an -c:v libx264 -preset ultrafast -x264opts rc-lookahead=5:bframes=0:ref=1 -pix_fmt yuv420p "${clipPath}"`;
         try {
           await runCommand(cmd, 60000);
           sceneClipPaths.push(clipPath);
@@ -422,7 +422,7 @@ app.post("/assemble-frames", async (req, res) => {
 
       const numFrames = sceneFrameUrls[sceneIdx].length;
       const sourceFps = numFrames / durationPerScene;
-      const cmd = `ffmpeg -y -framerate ${sourceFps} -i "${sceneDirs[sceneIdx]}/frame%d.jpg" -t ${durationPerScene} -vf "fps=25,scale=1080:1920" -c:v libx264 -preset ultrafast -pix_fmt yuv420p "${clipPath}"`;
+      const cmd = `ffmpeg -y -framerate ${sourceFps} -i "${sceneDirs[sceneIdx]}/frame%d.jpg" -t ${durationPerScene} -vf "fps=25,scale=1080:1920" -c:v libx264 -preset ultrafast -x264opts rc-lookahead=5:bframes=0:ref=1 -pix_fmt yuv420p "${clipPath}"`;
       await runCommand(cmd, 60000);
       sceneClipPaths.push(clipPath);
       console.log(`[${jobId}] Scene ${sceneIdx} frame-sequence clip created (${durationPerScene.toFixed(2)}s)`);
@@ -435,7 +435,7 @@ app.post("/assemble-frames", async (req, res) => {
     const concatenatedPath = path.join(tmpDir, `${jobId}_concatenated.mp4`);
     await runCommand(`ffmpeg -y -f concat -safe 0 -i "${concatListPath}" -c copy "${concatenatedPath}"`, 30000);
 
-    const finalCmd = `cd ${tmpDir} && ffmpeg -y -i "${concatenatedPath}" -i "${audioPath}" -vf "ass=captions.ass" -map 0:v -map 1:a -c:v libx264 -preset ultrafast -c:a aac -b:a 96k -shortest -t ${Math.min(audioDuration, 60)} "${outputPath}"`;
+    const finalCmd = `cd ${tmpDir} && ffmpeg -y -i "${concatenatedPath}" -i "${audioPath}" -vf "ass=captions.ass" -map 0:v -map 1:a -c:v libx264 -preset ultrafast -x264opts rc-lookahead=5:bframes=0:ref=1 -c:a aac -b:a 96k -shortest -t ${Math.min(audioDuration, 60)} "${outputPath}"`;
     await runCommand(finalCmd, 120000);
 
     console.log(`[${jobId}] Step 6: ffmpeg done. Output size: ${fs.statSync(outputPath).size}`);
