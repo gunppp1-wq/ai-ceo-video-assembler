@@ -500,8 +500,12 @@ app.post("/assemble-frames", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`ai-ceo-video-assembler (v4: real frame sequences) listening on port ${PORT}`);
-  startPiperServer();
-  await waitForPiperReady();
+  // Piper TTS disabled for now (2026-06-28): its always-on process was consuming
+  // memory continuously while never successfully serving audio, contributing to
+  // repeated OOM crashes during video assembly. Re-enable once Piper reliability
+  // is fixed separately. Aura-2 (Cloudflare AI) is used as TTS in the meantime.
+  // startPiperServer();
+  // await waitForPiperReady();
 });
 
 
