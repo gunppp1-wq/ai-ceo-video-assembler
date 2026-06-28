@@ -435,7 +435,7 @@ app.post("/assemble-frames", async (req, res) => {
     const concatenatedPath = path.join(tmpDir, `${jobId}_concatenated.mp4`);
     await runCommand(`ffmpeg -y -f concat -safe 0 -i "${concatListPath}" -c copy "${concatenatedPath}"`, 30000);
 
-    const finalCmd = `cd ${tmpDir} && ffmpeg -y -i "${concatenatedPath}" -i "${audioPath}" -vf "ass=captions.ass" -map 0:v -map 1:a -c:v libx264 -preset ultrafast -x264opts rc-lookahead=5:bframes=0:ref=1 -c:a aac -b:a 96k -shortest -t ${Math.min(audioDuration, 60)} "${outputPath}"`;
+    const finalCmd = `cd ${tmpDir} && ffmpeg -y -i "${concatenatedPath}" -i "${audioPath}" -map 0:v -map 1:a -c:v libx264 -preset ultrafast -x264opts rc-lookahead=5:bframes=0:ref=1 -c:a aac -b:a 96k -shortest -t ${Math.min(audioDuration, 60)} "${outputPath}"`;
     await runCommand(finalCmd, 120000);
 
     console.log(`[${jobId}] Step 6: ffmpeg done. Output size: ${fs.statSync(outputPath).size}`);
