@@ -1,4 +1,4 @@
-﻿const express = require("express");
+const express = require("express");
 const https = require("https");
 const fs = require("fs");
 const path = require("path");
@@ -8,6 +8,17 @@ const { startPiperServer, waitForPiperReady, isPiperReady, getPiperEndpoint } = 
 
 const app = express();
 app.use(express.json({ limit: "20mb" }));
+
+// In-memory job store for async assembly jobs.
+// Keys are jobIds (UUID strings). Values: { status, startedAt, result?, error? }
+const assemblyJobs = new Map();
+
+function pruneOldJobs() {
+  const cutoff = Date.now() - 2 * 60 * 60 * 1000;
+  for (const [id, job] of assemblyJobs.entries()) {
+    if (job.startedAt < cutoff) assemblyJobs.delete(id);
+  }
+}
 
 function downloadFile(url, destPath) {
   return new Promise((resolve, reject) => {
@@ -117,6 +128,148 @@ async function transcribeAudio(audioPath) {
   const stdout = await runCommand(`python3 transcribe.py "${audioPath}"`, 60000);
   const result = JSON.parse(stdout.trim().split("\n").pop());
   return result.words || [];
+}
+
+// Core assembly logic shared by /assemble-frames (sync) and /assemble-frames-async (async).
+// Returns { success, fileName, fileId, wordsTranscribed, scenes } on success, throws on failure.
+async function runAssemblyCore(jobId, body) {
+  const { sceneFrameUrls, sceneVideoUrls, audioUrl, b2KeyId, b2ApplicationKey, b2BucketId, outputFileName } = body;
+  const realClipUrls = sceneVideoUrls || [];
+  const tmpDir = "/tmp";
+  const audioPath = path.join(tmpDir, `${jobId}.mp3`);
+  const outputPath = path.join(tmpDir, `${jobId}.mp4`);
+  const sceneClipPaths = [];
+  // Declared outside try so finally can reference it for cleanup.
+  const rawClipPaths = [];
+
+  try {
+    console.log(`[${jobId}] Step 1: Downloading audio and ${sceneFrameUrls.length} scene frame sequences...`);
+    await downloadFile(audioUrl, audioPath);
+
+    const sceneDirs = [];
+    for (let sceneIdx = 0; sceneIdx < sceneFrameUrls.length; sceneIdx++) {
+      const sceneDir = path.join(tmpDir, `${jobId}_scene${sceneIdx}`);
+      fs.mkdirSync(sceneDir, { recursive: true });
+      sceneDirs.push(sceneDir);
+
+      const frameUrls = sceneFrameUrls[sceneIdx];
+      await Promise.all(frameUrls.map((url, i) =>
+        downloadFile(url, path.join(sceneDir, `frame${i}.jpg`))
+      ));
+      console.log(`[${jobId}] Downloaded ${frameUrls.length} frames for scene ${sceneIdx}`);
+    }
+
+    console.log(`[${jobId}] Step 2: Getting audio duration...`);
+    const audioDuration = await getAudioDuration(audioPath);
+    const durationPerScene = Math.min(audioDuration, 60) / sceneFrameUrls.length;
+    console.log(`[${jobId}] Audio duration: ${audioDuration}s, ${durationPerScene}s per scene`);
+
+    console.log(`[${jobId}] Step 3: Transcribing audio for captions...`);
+    let words = [];
+    try {
+      // Disabled: transcribeAudio() was causing OOM crashes on Render free tier (confirmed via Events log 2026-06-27). words stays [].
+      console.log(`[${jobId}] Transcribed ${words.length} words`);
+    } catch (transcribeErr) {
+      console.log(`[${jobId}] WARNING: Transcription failed, proceeding without captions:`, transcribeErr.message);
+    }
+
+    const assContent = buildAssFromWords(words);
+    fs.writeFileSync(path.join(tmpDir, "captions.ass"), assContent);
+
+    console.log(`[${jobId}] Step 4: Building each scene clip (real video where available, frame sequence otherwise)...`);
+    for (let sceneIdx = 0; sceneIdx < sceneDirs.length; sceneIdx++) {
+      const clipPath = path.join(tmpDir, `${jobId}_clip${sceneIdx}.mp4`);
+      const realVideoUrl = realClipUrls[sceneIdx];
+
+      if (realVideoUrl) {
+        const rawClipPath = path.join(tmpDir, `${jobId}_raw${sceneIdx}.mp4`);
+        rawClipPaths.push(rawClipPath);
+        console.log(`[${jobId}] Scene ${sceneIdx}: downloading real clip from Pexels...`);
+        await downloadFile(realVideoUrl, rawClipPath);
+
+        const cmd = `ffmpeg -y -threads 1 -i "${rawClipPath}" -t ${durationPerScene} -vf "fps=25,scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920" -an -c:v libx264 -preset ultrafast -x264opts rc-lookahead=5:bframes=0:ref=1:threads=1 -pix_fmt yuv420p "${clipPath}"`;
+        try {
+          await runCommand(cmd, 60000);
+          sceneClipPaths.push(clipPath);
+          console.log(`[${jobId}] Scene ${sceneIdx} real-clip motion created (${durationPerScene.toFixed(2)}s)`);
+          continue;
+        } catch (realClipErr) {
+          console.log(`[${jobId}] WARNING: real clip failed for scene ${sceneIdx}, falling back to frame sequence:`, realClipErr.message);
+        }
+      }
+
+      const numFrames = sceneFrameUrls[sceneIdx].length;
+      const sourceFps = numFrames / durationPerScene;
+      const cmd = `ffmpeg -y -threads 1 -framerate ${sourceFps} -i "${sceneDirs[sceneIdx]}/frame%d.jpg" -t ${durationPerScene} -vf "fps=25,scale=1080:1920" -c:v libx264 -preset ultrafast -x264opts rc-lookahead=5:bframes=0:ref=1:threads=1 -pix_fmt yuv420p "${clipPath}"`;
+      await runCommand(cmd, 60000);
+      sceneClipPaths.push(clipPath);
+      console.log(`[${jobId}] Scene ${sceneIdx} frame-sequence clip created (${durationPerScene.toFixed(2)}s)`);
+    }
+
+    console.log(`[${jobId}] Step 5: Concatenating scene clips, adding captions and audio...`);
+    const concatListPath = path.join(tmpDir, `${jobId}_concat.txt`);
+    fs.writeFileSync(concatListPath, sceneClipPaths.map(p => `file '${p}'`).join("\n"));
+
+    const concatenatedPath = path.join(tmpDir, `${jobId}_concatenated.mp4`);
+    await runCommand(`ffmpeg -y -f concat -safe 0 -i "${concatListPath}" -c copy "${concatenatedPath}"`, 30000);
+
+    const finalCmd = `cd ${tmpDir} && ffmpeg -y -threads 1 -i "${concatenatedPath}" -i "${audioPath}" -map 0:v -map 1:a -c:v libx264 -preset ultrafast -x264opts rc-lookahead=5:bframes=0:ref=1:threads=1 -c:a aac -b:a 96k -shortest -t ${Math.min(audioDuration, 60)} "${outputPath}"`;
+    await runCommand(finalCmd, 120000);
+
+    console.log(`[${jobId}] Step 6: ffmpeg done. Output size: ${fs.statSync(outputPath).size}`);
+
+    console.log(`[${jobId}] Step 7: Authorizing B2...`);
+    const credentials = Buffer.from(`${b2KeyId}:${b2ApplicationKey}`).toString("base64");
+    const authRes = await fetch("https://api.backblazeb2.com/b2api/v3/b2_authorize_account", {
+      headers: { Authorization: `Basic ${credentials}` }
+    });
+    if (!authRes.ok) throw new Error(`B2 authorize failed: ${authRes.status} ${await authRes.text()}`);
+    const authData = await authRes.json();
+    const apiUrl = authData.apiInfo.storageApi.apiUrl;
+
+    console.log(`[${jobId}] Step 8: Getting upload URL...`);
+    const uploadUrlRes = await fetch(`${apiUrl}/b2api/v3/b2_get_upload_url?bucketId=${b2BucketId}`, {
+      headers: { Authorization: authData.authorizationToken }
+    });
+    if (!uploadUrlRes.ok) throw new Error(`B2 get upload URL failed: ${uploadUrlRes.status}`);
+    const uploadUrlData = await uploadUrlRes.json();
+
+    console.log(`[${jobId}] Step 9: Uploading final video to B2...`);
+    const fileBuffer = fs.readFileSync(outputPath);
+    const sha1Hex = crypto.createHash("sha1").update(fileBuffer).digest("hex");
+
+    const uploadRes = await fetch(uploadUrlData.uploadUrl, {
+      method: "POST",
+      headers: {
+        Authorization: uploadUrlData.authorizationToken,
+        "X-Bz-File-Name": encodeURIComponent(outputFileName),
+        "Content-Type": "video/mp4",
+        "X-Bz-Content-Sha1": sha1Hex,
+        "Content-Length": fileBuffer.length
+      },
+      body: fileBuffer
+    });
+    if (!uploadRes.ok) throw new Error(`B2 upload failed: ${uploadRes.status} ${await uploadRes.text()}`);
+    const uploadResult = await uploadRes.json();
+
+    console.log(`[${jobId}] Done: ${outputFileName}`);
+    return { success: true, fileName: outputFileName, fileId: uploadResult.fileId, wordsTranscribed: words.length, scenes: sceneFrameUrls.length };
+  } finally {
+    try {
+      const cleanupPaths = [audioPath, outputPath, path.join(tmpDir, "captions.ass"), path.join(tmpDir, `${jobId}_concat.txt`), path.join(tmpDir, `${jobId}_concatenated.mp4`)];
+      sceneClipPaths.forEach(p => cleanupPaths.push(p));
+      rawClipPaths.forEach(p => cleanupPaths.push(p));
+      cleanupPaths.forEach((p) => {
+        try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch (e) {}
+      });
+      for (let i = 0; i < sceneFrameUrls.length; i++) {
+        const sceneDir = path.join(tmpDir, `${jobId}_scene${i}`);
+        try { fs.rmSync(sceneDir, { recursive: true, force: true }); } catch (e) {}
+      }
+    } catch (cleanupErr) {
+      console.log("Cleanup error (non-fatal):", cleanupErr.message);
+    }
+  }
 }
 
 app.get("/", (req, res) => {
@@ -349,152 +502,63 @@ app.post("/analyze-extract", async (req, res) => {
   }
 });
 
+// Synchronous assembly — kept for direct testing and backward compatibility.
+// The orchestrator now uses /assemble-frames-async instead.
 app.post("/assemble-frames", async (req, res) => {
   const { sceneFrameUrls, sceneVideoUrls, audioUrl, b2KeyId, b2ApplicationKey, b2BucketId, outputFileName } = req.body;
-  const realClipUrls = sceneVideoUrls || [];
 
   if (!sceneFrameUrls || !Array.isArray(sceneFrameUrls) || sceneFrameUrls.length === 0 || !audioUrl || !b2KeyId || !b2ApplicationKey || !b2BucketId || !outputFileName) {
     return res.status(400).json({ error: "Missing required fields: sceneFrameUrls (array of arrays), audioUrl, b2KeyId, b2ApplicationKey, b2BucketId, outputFileName" });
   }
 
   const jobId = crypto.randomUUID();
-  const tmpDir = "/tmp";
-  const audioPath = path.join(tmpDir, `${jobId}.mp3`);
-  const outputPath = path.join(tmpDir, `${jobId}.mp4`);
-  const sceneClipPaths = [];
-
   try {
-    console.log(`[${jobId}] Step 1: Downloading audio and ${sceneFrameUrls.length} scene frame sequences...`);
-    await downloadFile(audioUrl, audioPath);
-
-    const sceneDirs = [];
-    for (let sceneIdx = 0; sceneIdx < sceneFrameUrls.length; sceneIdx++) {
-      const sceneDir = path.join(tmpDir, `${jobId}_scene${sceneIdx}`);
-      fs.mkdirSync(sceneDir, { recursive: true });
-      sceneDirs.push(sceneDir);
-
-      const frameUrls = sceneFrameUrls[sceneIdx];
-      await Promise.all(frameUrls.map((url, i) =>
-        downloadFile(url, path.join(sceneDir, `frame${i}.jpg`))
-      ));
-      console.log(`[${jobId}] Downloaded ${frameUrls.length} frames for scene ${sceneIdx}`);
-    }
-
-    console.log(`[${jobId}] Step 2: Getting audio duration...`);
-    const audioDuration = await getAudioDuration(audioPath);
-    const durationPerScene = Math.min(audioDuration, 60) / sceneFrameUrls.length;
-    console.log(`[${jobId}] Audio duration: ${audioDuration}s, ${durationPerScene}s per scene`);
-
-    console.log(`[${jobId}] Step 3: Transcribing audio for captions...`);
-    let words = [];
-    try {
-      // Disabled: transcribeAudio() was causing OOM crashes on Render free tier (confirmed via Events log 2026-06-27). words stays [].
-      console.log(`[${jobId}] Transcribed ${words.length} words`);
-    } catch (transcribeErr) {
-      console.log(`[${jobId}] WARNING: Transcription failed, proceeding without captions:`, transcribeErr.message);
-    }
-
-    const assContent = buildAssFromWords(words);
-    fs.writeFileSync(path.join(tmpDir, "captions.ass"), assContent);
-
-    console.log(`[${jobId}] Step 4: Building each scene clip (real video where available, frame sequence otherwise)...`);
-    const rawClipPaths = [];
-    for (let sceneIdx = 0; sceneIdx < sceneDirs.length; sceneIdx++) {
-      const clipPath = path.join(tmpDir, `${jobId}_clip${sceneIdx}.mp4`);
-      const realVideoUrl = realClipUrls[sceneIdx];
-
-      if (realVideoUrl) {
-        const rawClipPath = path.join(tmpDir, `${jobId}_raw${sceneIdx}.mp4`);
-        rawClipPaths.push(rawClipPath);
-        console.log(`[${jobId}] Scene ${sceneIdx}: downloading real clip from Pexels...`);
-        await downloadFile(realVideoUrl, rawClipPath);
-
-        const cmd = `ffmpeg -y -threads 1 -i "${rawClipPath}" -t ${durationPerScene} -vf "fps=25,scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920" -an -c:v libx264 -preset ultrafast -x264opts rc-lookahead=5:bframes=0:ref=1:threads=1 -pix_fmt yuv420p "${clipPath}"`;
-        try {
-          await runCommand(cmd, 60000);
-          sceneClipPaths.push(clipPath);
-          console.log(`[${jobId}] Scene ${sceneIdx} real-clip motion created (${durationPerScene.toFixed(2)}s)`);
-          continue;
-        } catch (realClipErr) {
-          console.log(`[${jobId}] WARNING: real clip failed for scene ${sceneIdx}, falling back to frame sequence:`, realClipErr.message);
-        }
-      }
-
-      const numFrames = sceneFrameUrls[sceneIdx].length;
-      const sourceFps = numFrames / durationPerScene;
-      const cmd = `ffmpeg -y -threads 1 -framerate ${sourceFps} -i "${sceneDirs[sceneIdx]}/frame%d.jpg" -t ${durationPerScene} -vf "fps=25,scale=1080:1920" -c:v libx264 -preset ultrafast -x264opts rc-lookahead=5:bframes=0:ref=1:threads=1 -pix_fmt yuv420p "${clipPath}"`;
-      await runCommand(cmd, 60000);
-      sceneClipPaths.push(clipPath);
-      console.log(`[${jobId}] Scene ${sceneIdx} frame-sequence clip created (${durationPerScene.toFixed(2)}s)`);
-    }
-
-    console.log(`[${jobId}] Step 5: Concatenating scene clips, adding captions and audio...`);
-    const concatListPath = path.join(tmpDir, `${jobId}_concat.txt`);
-    fs.writeFileSync(concatListPath, sceneClipPaths.map(p => `file '${p}'`).join("\n"));
-
-    const concatenatedPath = path.join(tmpDir, `${jobId}_concatenated.mp4`);
-    await runCommand(`ffmpeg -y -f concat -safe 0 -i "${concatListPath}" -c copy "${concatenatedPath}"`, 30000);
-
-    const finalCmd = `cd ${tmpDir} && ffmpeg -y -threads 1 -i "${concatenatedPath}" -i "${audioPath}" -map 0:v -map 1:a -c:v libx264 -preset ultrafast -x264opts rc-lookahead=5:bframes=0:ref=1:threads=1 -c:a aac -b:a 96k -shortest -t ${Math.min(audioDuration, 60)} "${outputPath}"`;
-    await runCommand(finalCmd, 120000);
-
-    console.log(`[${jobId}] Step 6: ffmpeg done. Output size: ${fs.statSync(outputPath).size}`);
-
-    console.log(`[${jobId}] Step 7: Authorizing B2...`);
-    const credentials = Buffer.from(`${b2KeyId}:${b2ApplicationKey}`).toString("base64");
-    const authRes = await fetch("https://api.backblazeb2.com/b2api/v3/b2_authorize_account", {
-      headers: { Authorization: `Basic ${credentials}` }
-    });
-    if (!authRes.ok) throw new Error(`B2 authorize failed: ${authRes.status} ${await authRes.text()}`);
-    const authData = await authRes.json();
-    const apiUrl = authData.apiInfo.storageApi.apiUrl;
-
-    console.log(`[${jobId}] Step 8: Getting upload URL...`);
-    const uploadUrlRes = await fetch(`${apiUrl}/b2api/v3/b2_get_upload_url?bucketId=${b2BucketId}`, {
-      headers: { Authorization: authData.authorizationToken }
-    });
-    if (!uploadUrlRes.ok) throw new Error(`B2 get upload URL failed: ${uploadUrlRes.status}`);
-    const uploadUrlData = await uploadUrlRes.json();
-
-    console.log(`[${jobId}] Step 9: Uploading final video to B2...`);
-    const fileBuffer = fs.readFileSync(outputPath);
-    const sha1Hex = crypto.createHash("sha1").update(fileBuffer).digest("hex");
-
-    const uploadRes = await fetch(uploadUrlData.uploadUrl, {
-      method: "POST",
-      headers: {
-        Authorization: uploadUrlData.authorizationToken,
-        "X-Bz-File-Name": encodeURIComponent(outputFileName),
-        "Content-Type": "video/mp4",
-        "X-Bz-Content-Sha1": sha1Hex,
-        "Content-Length": fileBuffer.length
-      },
-      body: fileBuffer
-    });
-    if (!uploadRes.ok) throw new Error(`B2 upload failed: ${uploadRes.status} ${await uploadRes.text()}`);
-    const uploadResult = await uploadRes.json();
-
-    console.log(`[${jobId}] Done: ${outputFileName}`);
-    res.json({ success: true, fileName: outputFileName, fileId: uploadResult.fileId, wordsTranscribed: words.length, scenes: sceneFrameUrls.length });
+    const result = await runAssemblyCore(jobId, req.body);
+    res.json(result);
   } catch (err) {
     console.error(`[${jobId}] ERROR:`, err.message);
     res.status(500).json({ error: err.message });
-  } finally {
-    try {
-      const cleanupPaths = [audioPath, outputPath, path.join(tmpDir, "captions.ass"), path.join(tmpDir, `${jobId}_concat.txt`), path.join(tmpDir, `${jobId}_concatenated.mp4`)];
-      sceneClipPaths.forEach(p => cleanupPaths.push(p));
-      rawClipPaths.forEach(p => cleanupPaths.push(p));
-      cleanupPaths.forEach((p) => {
-        try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch (e) {}
-      });
-      for (let i = 0; i < sceneFrameUrls.length; i++) {
-        const sceneDir = path.join(tmpDir, `${jobId}_scene${i}`);
-        try { fs.rmSync(sceneDir, { recursive: true, force: true }); } catch (e) {}
-      }
-    } catch (cleanupErr) {
-      console.log("Cleanup error (non-fatal):", cleanupErr.message);
-    }
   }
+});
+
+// Async assembly — validates and returns a jobId immediately, runs assembly in background.
+// Caller polls GET /job-status/:jobId for completion.
+app.post("/assemble-frames-async", (req, res) => {
+  const { sceneFrameUrls, sceneVideoUrls, audioUrl, b2KeyId, b2ApplicationKey, b2BucketId, outputFileName } = req.body;
+
+  if (!sceneFrameUrls || !Array.isArray(sceneFrameUrls) || sceneFrameUrls.length === 0 || !audioUrl || !b2KeyId || !b2ApplicationKey || !b2BucketId || !outputFileName) {
+    return res.status(400).json({ error: "Missing required fields: sceneFrameUrls (array of arrays), audioUrl, b2KeyId, b2ApplicationKey, b2BucketId, outputFileName" });
+  }
+
+  const jobId = crypto.randomUUID();
+  assemblyJobs.set(jobId, { status: "processing", startedAt: Date.now() });
+
+  // Respond before starting work so the caller is never waiting through ffmpeg.
+  res.json({ jobId, status: "processing" });
+
+  setImmediate(async () => {
+    pruneOldJobs();
+    try {
+      const result = await runAssemblyCore(jobId, req.body);
+      const existing = assemblyJobs.get(jobId);
+      assemblyJobs.set(jobId, { status: "done", startedAt: existing ? existing.startedAt : Date.now(), result });
+    } catch (err) {
+      console.error(`[${jobId}] async job failed:`, err.message);
+      const existing = assemblyJobs.get(jobId);
+      assemblyJobs.set(jobId, { status: "failed", startedAt: existing ? existing.startedAt : Date.now(), error: err.message });
+    }
+  });
+});
+
+// Returns the current state of an async assembly job.
+// 404 means the job is not in memory (Render restarted); caller should re-queue.
+app.get("/job-status/:jobId", (req, res) => {
+  const job = assemblyJobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: "job_not_found" });
+  const resp = { jobId: req.params.jobId, status: job.status };
+  if (job.result) resp.result = job.result;
+  if (job.error) resp.error = job.error;
+  res.json(resp);
 });
 
 const PORT = process.env.PORT || 3000;
@@ -507,27 +571,3 @@ app.listen(PORT, async () => {
   // startPiperServer();
   // await waitForPiperReady();
 });
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
