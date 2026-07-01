@@ -1,5 +1,6 @@
 const express = require("express");
 const https = require("https");
+const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
@@ -23,7 +24,8 @@ function pruneOldJobs() {
 function downloadFile(url, destPath) {
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(destPath);
-    https.get(url, (response) => {
+    const protocol = url.startsWith("https") ? https : http;
+    protocol.get(url, (response) => {
       if (response.statusCode !== 200) {
         reject(new Error(`Download failed: ${response.statusCode} for ${url}`));
         return;
@@ -144,11 +146,17 @@ async function runAssemblyCore(jobId, body) {
   const rawClipPaths = [];
 
   try {
-    console.log(`[${jobId}] Step 1: Downloading audio${musicUrl ? " + music track" : ""} and ${sceneFrameUrls.length} scene frame sequences...`);
+    console.log(`[${jobId}] Step 1: Downloading audio and ${sceneFrameUrls.length} scene frame sequences...`);
     await downloadFile(audioUrl, audioPath);
+
     if (musicUrl && musicPath) {
-      await downloadFile(musicUrl, musicPath);
-      console.log(`[${jobId}] Music track downloaded`);
+      try {
+        await downloadFile(musicUrl, musicPath);
+        console.log(`[${jobId}] Background music downloaded`);
+      } catch (musicErr) {
+        console.log(`[${jobId}] WARNING: music download failed, proceeding without music:`, musicErr.message);
+        // musicPath stays set but file won't exist; we'll check below
+      }
     }
 
     const sceneDirs = [];
@@ -218,13 +226,13 @@ async function runAssemblyCore(jobId, body) {
     const concatenatedPath = path.join(tmpDir, `${jobId}_concatenated.mp4`);
     await runCommand(`ffmpeg -y -f concat -safe 0 -i "${concatListPath}" -c copy "${concatenatedPath}"`, 30000);
 
-    const videoLen = Math.min(audioDuration, 60);
+    const hasMusicFile = musicPath && fs.existsSync(musicPath);
     let finalCmd;
-    if (musicPath) {
-      // Mix narration (weight 1.0) with background music (weight 0.12 = 12% volume), loop music to fill full duration.
-      finalCmd = `cd ${tmpDir} && ffmpeg -y -threads 1 -i "${concatenatedPath}" -i "${audioPath}" -stream_loop -1 -i "${musicPath}" -map 0:v -filter_complex "[1:a][2:a]amix=inputs=2:weights=1 0.12:normalize=0[aout]" -map "[aout]" -c:v libx264 -preset ultrafast -x264opts rc-lookahead=5:bframes=0:ref=1:threads=1 -c:a aac -b:a 96k -shortest -t ${videoLen} "${outputPath}"`;
+    if (hasMusicFile) {
+      finalCmd = `cd ${tmpDir} && ffmpeg -y -threads 1 -i "${concatenatedPath}" -i "${audioPath}" -i "${musicPath}" -filter_complex "[1:a]volume=1.0[voice];[2:a]volume=0.12[music];[voice][music]amix=inputs=2:duration=shortest[aout]" -map 0:v -map "[aout]" -c:v libx264 -preset ultrafast -x264opts rc-lookahead=5:bframes=0:ref=1:threads=1 -c:a aac -b:a 96k -shortest -t ${Math.min(audioDuration, 60)} "${outputPath}"`;
+      console.log(`[${jobId}] Mixing voice + background music (music at 12% volume)`);
     } else {
-      finalCmd = `cd ${tmpDir} && ffmpeg -y -threads 1 -i "${concatenatedPath}" -i "${audioPath}" -map 0:v -map 1:a -c:v libx264 -preset ultrafast -x264opts rc-lookahead=5:bframes=0:ref=1:threads=1 -c:a aac -b:a 96k -shortest -t ${videoLen} "${outputPath}"`;
+      finalCmd = `cd ${tmpDir} && ffmpeg -y -threads 1 -i "${concatenatedPath}" -i "${audioPath}" -map 0:v -map 1:a -c:v libx264 -preset ultrafast -x264opts rc-lookahead=5:bframes=0:ref=1:threads=1 -c:a aac -b:a 96k -shortest -t ${Math.min(audioDuration, 60)} "${outputPath}"`;
     }
     await runCommand(finalCmd, 120000);
 
