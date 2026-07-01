@@ -133,18 +133,23 @@ async function transcribeAudio(audioPath) {
 // Core assembly logic shared by /assemble-frames (sync) and /assemble-frames-async (async).
 // Returns { success, fileName, fileId, wordsTranscribed, scenes } on success, throws on failure.
 async function runAssemblyCore(jobId, body) {
-  const { sceneFrameUrls, sceneVideoUrls, audioUrl, b2KeyId, b2ApplicationKey, b2BucketId, outputFileName } = body;
+  const { sceneFrameUrls, sceneVideoUrls, audioUrl, musicUrl, b2KeyId, b2ApplicationKey, b2BucketId, outputFileName } = body;
   const realClipUrls = sceneVideoUrls || [];
   const tmpDir = "/tmp";
   const audioPath = path.join(tmpDir, `${jobId}.mp3`);
+  const musicPath = musicUrl ? path.join(tmpDir, `${jobId}_music.mp3`) : null;
   const outputPath = path.join(tmpDir, `${jobId}.mp4`);
   const sceneClipPaths = [];
   // Declared outside try so finally can reference it for cleanup.
   const rawClipPaths = [];
 
   try {
-    console.log(`[${jobId}] Step 1: Downloading audio and ${sceneFrameUrls.length} scene frame sequences...`);
+    console.log(`[${jobId}] Step 1: Downloading audio${musicUrl ? " + music track" : ""} and ${sceneFrameUrls.length} scene frame sequences...`);
     await downloadFile(audioUrl, audioPath);
+    if (musicUrl && musicPath) {
+      await downloadFile(musicUrl, musicPath);
+      console.log(`[${jobId}] Music track downloaded`);
+    }
 
     const sceneDirs = [];
     for (let sceneIdx = 0; sceneIdx < sceneFrameUrls.length; sceneIdx++) {
@@ -213,7 +218,14 @@ async function runAssemblyCore(jobId, body) {
     const concatenatedPath = path.join(tmpDir, `${jobId}_concatenated.mp4`);
     await runCommand(`ffmpeg -y -f concat -safe 0 -i "${concatListPath}" -c copy "${concatenatedPath}"`, 30000);
 
-    const finalCmd = `cd ${tmpDir} && ffmpeg -y -threads 1 -i "${concatenatedPath}" -i "${audioPath}" -map 0:v -map 1:a -c:v libx264 -preset ultrafast -x264opts rc-lookahead=5:bframes=0:ref=1:threads=1 -c:a aac -b:a 96k -shortest -t ${Math.min(audioDuration, 60)} "${outputPath}"`;
+    const videoLen = Math.min(audioDuration, 60);
+    let finalCmd;
+    if (musicPath) {
+      // Mix narration (weight 1.0) with background music (weight 0.12 = 12% volume), loop music to fill full duration.
+      finalCmd = `cd ${tmpDir} && ffmpeg -y -threads 1 -i "${concatenatedPath}" -i "${audioPath}" -stream_loop -1 -i "${musicPath}" -map 0:v -filter_complex "[1:a][2:a]amix=inputs=2:weights=1 0.12:normalize=0[aout]" -map "[aout]" -c:v libx264 -preset ultrafast -x264opts rc-lookahead=5:bframes=0:ref=1:threads=1 -c:a aac -b:a 96k -shortest -t ${videoLen} "${outputPath}"`;
+    } else {
+      finalCmd = `cd ${tmpDir} && ffmpeg -y -threads 1 -i "${concatenatedPath}" -i "${audioPath}" -map 0:v -map 1:a -c:v libx264 -preset ultrafast -x264opts rc-lookahead=5:bframes=0:ref=1:threads=1 -c:a aac -b:a 96k -shortest -t ${videoLen} "${outputPath}"`;
+    }
     await runCommand(finalCmd, 120000);
 
     console.log(`[${jobId}] Step 6: ffmpeg done. Output size: ${fs.statSync(outputPath).size}`);
@@ -257,6 +269,7 @@ async function runAssemblyCore(jobId, body) {
   } finally {
     try {
       const cleanupPaths = [audioPath, outputPath, path.join(tmpDir, "captions.ass"), path.join(tmpDir, `${jobId}_concat.txt`), path.join(tmpDir, `${jobId}_concatenated.mp4`)];
+      if (musicPath) cleanupPaths.push(musicPath);
       sceneClipPaths.forEach(p => cleanupPaths.push(p));
       rawClipPaths.forEach(p => cleanupPaths.push(p));
       cleanupPaths.forEach((p) => {
